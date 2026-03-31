@@ -29,7 +29,32 @@ const NAME = getArg("name", "Claude Code");
 const PROVIDER = getArg("provider", "Anthropic");
 const HOST = getArg("host", os.hostname());
 const SERVER = getArg("server", "ws://localhost:5000/ws");
+const MODE = getArg("mode", "claude"); // "claude" | "codex" | "shell"
+const CWD = getArg("cwd", process.cwd());
 const HEARTBEAT_INTERVAL = 5000; // 5s
+
+// ---- Find Claude Code binary ----
+function findClaudeBinary(): string | null {
+  try {
+    const base = `${os.homedir()}/Library/Application Support/Claude/claude-code`;
+    const versions = execSync(`ls "${base}" 2>/dev/null`, { encoding: "utf-8" }).trim().split("\n").filter(Boolean);
+    if (versions.length === 0) return null;
+    // Pick the latest version
+    const latest = versions.sort().pop()!;
+    const bin = `${base}/${latest}/claude.app/Contents/MacOS/claude`;
+    try { execSync(`test -x "${bin}"`); return bin; } catch { return null; }
+  } catch { return null; }
+}
+
+function findCodexBinary(): string | null {
+  try {
+    const path = execSync("which codex 2>/dev/null", { encoding: "utf-8" }).trim();
+    return path || null;
+  } catch { return null; }
+}
+
+const CLAUDE_BIN = findClaudeBinary();
+const CODEX_BIN = findCodexBinary();
 
 // ---- System Stats ----
 function getSystemStats(): Record<string, string> {
@@ -138,35 +163,73 @@ function connect() {
 
     if (msg.type === "command") {
       const { commandId, text } = msg.payload;
-      console.log(`[bridge] Received command: ${text}`);
+      console.log(`[bridge] Received command (${MODE}): ${text}`);
       currentTask = text;
 
-      // Log that we're executing
-      ws.send(JSON.stringify({
-        type: "log",
-        payload: { logType: "output", text: `Executing: ${text}` },
-      }));
+      // Determine how to execute based on mode
+      let child: ReturnType<typeof spawn>;
 
-      // Execute the command in a shell
-      const child = spawn("sh", ["-c", text], {
-        cwd: process.cwd(),
-        env: { ...process.env },
-      });
+      if (MODE === "claude" && CLAUDE_BIN) {
+        // Send to Claude Code as a prompt — it thinks, codes, and responds
+        ws.send(JSON.stringify({
+          type: "log",
+          payload: { logType: "system", text: `Sending to Claude Code: "${text}"` },
+        }));
+        child = spawn(CLAUDE_BIN, ["-p", text, "--output-format", "text"], {
+          cwd: CWD,
+          env: { ...process.env, TERM: "dumb" },
+        });
+      } else if (MODE === "codex" && CODEX_BIN) {
+        // Send to Codex CLI
+        ws.send(JSON.stringify({
+          type: "log",
+          payload: { logType: "system", text: `Sending to Codex: "${text}"` },
+        }));
+        child = spawn(CODEX_BIN, ["-q", text], {
+          cwd: CWD,
+          env: { ...process.env, TERM: "dumb" },
+        });
+      } else {
+        // Fallback to shell
+        ws.send(JSON.stringify({
+          type: "log",
+          payload: { logType: "system", text: `Running shell: ${text}` },
+        }));
+        child = spawn("sh", ["-c", text], {
+          cwd: CWD,
+          env: { ...process.env },
+        });
+      }
 
       let output = "";
+      let streamBuffer = "";
+      let streamTimer: ReturnType<typeof setTimeout> | null = null;
+
+      // Debounced stream — batches rapid output into ~200ms chunks for readability
+      function flushStream() {
+        if (streamBuffer) {
+          ws.send(JSON.stringify({
+            type: "log",
+            payload: { logType: "output", text: streamBuffer.trimEnd() },
+          }));
+          streamBuffer = "";
+        }
+        streamTimer = null;
+      }
 
       child.stdout.on("data", (data) => {
         const chunk = data.toString();
         output += chunk;
-        ws.send(JSON.stringify({
-          type: "log",
-          payload: { logType: "output", text: chunk.trimEnd() },
-        }));
+        streamBuffer += chunk;
+        if (!streamTimer) {
+          streamTimer = setTimeout(flushStream, 200);
+        }
       });
 
       child.stderr.on("data", (data) => {
         const chunk = data.toString();
         output += chunk;
+        // Stream errors immediately
         ws.send(JSON.stringify({
           type: "log",
           payload: { logType: "error", text: chunk.trimEnd() },
@@ -174,6 +237,10 @@ function connect() {
       });
 
       child.on("close", (code) => {
+        // Flush remaining output
+        if (streamTimer) clearTimeout(streamTimer);
+        flushStream();
+
         currentTask = null;
         ws.send(JSON.stringify({
           type: "command_result",
@@ -222,8 +289,20 @@ console.log(`
 ║  Name:     ${NAME.padEnd(25)}║
 ║  Provider: ${PROVIDER.padEnd(25)}║
 ║  Host:     ${HOST.padEnd(25)}║
-║  Server:   ${SERVER.padEnd(25)}║
+║  Mode:     ${MODE.padEnd(25)}║
+║  CWD:      ${CWD.slice(-25).padEnd(25)}║
+║  Server:   ${SERVER.slice(-25).padEnd(25)}║
+╠══════════════════════════════════════╣
+║  Claude:   ${(CLAUDE_BIN ? "Found" : "Not found").padEnd(25)}║
+║  Codex:    ${(CODEX_BIN ? "Found" : "Not found").padEnd(25)}║
 ╚══════════════════════════════════════╝
 `);
+
+if (MODE === "claude" && !CLAUDE_BIN) {
+  console.warn("[bridge] WARNING: Claude Code binary not found. Falling back to shell mode.");
+}
+if (MODE === "codex" && !CODEX_BIN) {
+  console.warn("[bridge] WARNING: Codex binary not found. Falling back to shell mode.");
+}
 
 connect();

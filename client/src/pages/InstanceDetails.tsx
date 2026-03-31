@@ -181,7 +181,7 @@ export default function InstanceDetails() {
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder={instance.status === "disconnected" ? "Agent disconnected" : "Send command to agent..."}
+            placeholder={instance.status === "disconnected" ? "Agent disconnected" : "Ask your agent anything..."}
             disabled={instance.status === "disconnected"}
             className="w-full bg-zinc-900 border border-white/10 rounded-xl pl-9 pr-12 py-3 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-indigo-500/50 placeholder:text-zinc-600 disabled:opacity-50"
           />
